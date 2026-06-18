@@ -1,0 +1,55 @@
+name: Deploy to SiteGround Production
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    name: Deploy Plugin to Production
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        
+      - name: Setup SSH key
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.SITEGROUND_SSH_KEY }}
+          
+      - name: Add SiteGround host key
+        run: |
+          mkdir -p ~/.ssh
+          ssh-keyscan -H ${{ secrets.SITEGROUND_HOST }} >> ~/.ssh/known_hosts
+          
+      - name: Sync plugin files to production
+        run: |
+          rsync -avz --delete \
+            --exclude='.git' \
+            --exclude='.github' \
+            --exclude='*.md' \
+            --exclude='.gitignore' \
+            --exclude='LICENSE' \
+            --exclude='worker/' \
+            wp-content/plugins/ca-civic-intelligence/ \
+            ${{ secrets.SITEGROUND_USER }}@${{ secrets.SITEGROUND_HOST }}:${{ secrets.SITEGROUND_PATH }}/wp-content/plugins/ca-civic-intelligence/
+            
+      - name: Sync rewrite fixer plugin
+        run: |
+          rsync -avz --delete \
+            --exclude='.git' \
+            wp-content/plugins/ca-civic-rewrite-fixer/ \
+            ${{ secrets.SITEGROUND_USER }}@${{ secrets.SITEGROUND_HOST }}:${{ secrets.SITEGROUND_PATH }}/wp-content/plugins/ca-civic-rewrite-fixer/
+            
+      - name: Flush OPcache on production
+        run: |
+          ssh ${{ secrets.SITEGROUND_USER }}@${{ secrets.SITEGROUND_HOST }} \
+            "php -r 'if(function_exists(\"opcache_reset\")){opcache_reset();echo \"OPcache cleared\\n\";}'"
+            
+      - name: Notify on success
+        if: success()
+        run: |
+          echo "Deployment successful to californiacivic.com"
+          echo "Deployed commit: ${{ github.sha }}"
