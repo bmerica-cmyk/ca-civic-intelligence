@@ -1,0 +1,8 @@
+# CA Civic Intelligence — Worker Dependencies
+# Install with: pip install -r requirements.txt
+
+requests>=2.31.0
+python-dotenv>=1.0.0
+openai>=1.0.0
+schedule>=1.2.0
+python-dateutil>=2.8.2
