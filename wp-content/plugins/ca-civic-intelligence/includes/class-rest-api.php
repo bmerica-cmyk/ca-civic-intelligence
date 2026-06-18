@@ -1,88 +1,110 @@
 <?php
 namespace CA_Civic_Intel;
+
 if ( ! defined( 'ABSPATH' ) ) exit;
 
-class Rest_Api {
-    const NS = 'ca-civic/v1';
+class REST_API {
+
+    public static function init() {
+        add_action( 'rest_api_init', array( __CLASS__, 'register_routes' ) );
+    }
 
     public static function register_routes() {
-        register_rest_route( self::NS, '/ingest/brief',  array( 'methods' => 'POST', 'callback' => array( __CLASS__, 'ingest_brief'  ), 'permission_callback' => array( __CLASS__, 'verify_hmac' ) ) );
-        register_rest_route( self::NS, '/ingest/event',  array( 'methods' => 'POST', 'callback' => array( __CLASS__, 'ingest_event'  ), 'permission_callback' => array( __CLASS__, 'verify_hmac' ) ) );
-        register_rest_route( self::NS, '/ingest/bill',   array( 'methods' => 'POST', 'callback' => array( __CLASS__, 'ingest_bill'   ), 'permission_callback' => array( __CLASS__, 'verify_hmac' ) ) );
-        register_rest_route( self::NS, '/ingest/docket', array( 'methods' => 'POST', 'callback' => array( __CLASS__, 'ingest_docket' ), 'permission_callback' => array( __CLASS__, 'verify_hmac' ) ) );
-    }
+        $ns = 'ca-civic/v1';
 
-    public static function verify_hmac( $request ) {
-        $secret = defined( 'CA_CIVIC_HMAC_SECRET' ) ? CA_CIVIC_HMAC_SECRET : '';
-        if ( empty( $secret ) ) return new WP_Error( 'no_secret', 'HMAC secret not configured.', array( 'status' => 500 ) );
+        register_rest_route( $ns, '/status', array(
+            'methods'             => 'GET',
+            'callback'            => array( __CLASS__, 'status' ),
+            'permission_callback' => '__return_true',
+        ) );
 
-        $sig  = $request->get_header( 'X-CA-Civic-Sig' );
-        $ts   = $request->get_header( 'X-CA-Civic-Ts' );
-        $body = $request->get_body();
+        register_rest_route( $ns, '/ingest/record', array(
+            'methods'             => 'POST',
+            'callback'            => array( __CLASS__, 'ingest_record' ),
+            'permission_callback' => array( __CLASS__, 'check_hmac' ),
+        ) );
 
-        if ( empty( $sig ) || empty( $ts ) ) return new WP_Error( 'missing_sig', 'Missing signature headers.', array( 'status' => 401 ) );
-        if ( abs( time() - intval( $ts ) ) > 300 ) return new WP_Error( 'expired', 'Request expired.', array( 'status' => 401 ) );
-
-        $expected = hash_hmac( 'sha256', $ts . '.' . $body, $secret );
-        if ( ! hash_equals( $expected, $sig ) ) return new WP_Error( 'bad_sig', 'Invalid signature.', array( 'status' => 403 ) );
-        return true;
-    }
-
-    public static function ingest_brief( $request ) {
-        if ( get_option( 'ca_civic_auto_publish_ai', '0' ) === '1' ) {
-            return new WP_Error( 'auto_publish_disabled', 'AI auto-publish is permanently disabled.', array( 'status' => 403 ) );
+        foreach ( array( 'event', 'bill', 'docket', 'brief' ) as $leg ) {
+            register_rest_route( $ns, '/ingest/' . $leg, array(
+                'methods'             => 'POST',
+                'callback'            => array( __CLASS__, 'ingest_record' ),
+                'permission_callback' => array( __CLASS__, 'check_hmac' ),
+            ) );
         }
+
+        register_rest_route( $ns, '/submission/(?P<id>[0-9]+)', array(
+            'methods'             => 'GET',
+            'callback'            => array( __CLASS__, 'get_submission_status' ),
+            'permission_callback' => array( __CLASS__, 'check_hmac' ),
+            'args'                => array( 'id' => array( 'validate_callback' => 'is_numeric' ) ),
+        ) );
+    }
+
+    public static function status( $request ) {
+        return rest_ensure_response( array(
+            'status'          => 'ok',
+            'plugin_version'  => CA_CIVIC_VERSION,
+            'auto_publish_ai' => get_option( 'ca_civic_auto_publish_ai', '0' ),
+            'wp_version'      => get_bloginfo( 'version' ),
+            'timestamp'       => gmdate( 'c' ),
+        ) );
+    }
+
+    public static function ingest_record( $request ) {
         $params = $request->get_json_params();
-        if ( empty( $params['title'] ) || empty( $params['content'] ) ) {
-            return new WP_Error( 'missing_fields', 'title and content are required.', array( 'status' => 400 ) );
+        if ( empty( $params ) ) {
+            return new WP_Error( 'no_data', 'No JSON body provided.', array( 'status' => 400 ) );
+        }
+        $type  = isset( $params['record_type'] ) ? sanitize_text_field( $params['record_type'] ) : 'ca_ai_brief';
+        $types = array( 'ca_ai_brief', 'ca_public_event', 'ca_bill', 'ca_reg_docket' );
+        if ( ! in_array( $type, $types, true ) ) {
+            return new WP_Error( 'invalid_type', 'Invalid record_type.', array( 'status' => 400 ) );
+        }
+        $title   = isset( $params['title'] )      ? sanitize_text_field( $params['title'] ) : '';
+        $content = isset( $params['content'] )    ? wp_kses_post( $params['content'] )      : '';
+        $source  = isset( $params['source_url'] ) ? esc_url_raw( $params['source_url'] )    : '';
+        if ( empty( $title ) ) {
+            return new WP_Error( 'no_title', 'Title is required.', array( 'status' => 400 ) );
         }
         $post_id = wp_insert_post( array(
-            'post_type'    => 'ca_ai_brief',
-            'post_title'   => sanitize_text_field( $params['title'] ),
-            'post_content' => wp_kses_post( $params['content'] ),
-            'post_status'  => 'draft',
-            'post_author'  => 1,
+            'post_type' => $type, 'post_title' => $title,
+            'post_content' => $content, 'post_status' => 'draft',
         ), true );
-        if ( is_wp_error( $post_id ) ) return $post_id;
-        if ( ! empty( $params['sources'] ) && is_array( $params['sources'] ) ) {
-            update_post_meta( $post_id, '_ca_civic_sources', array_map( 'esc_url_raw', $params['sources'] ) );
-        }
+        if ( is_wp_error( $post_id ) ) { return $post_id; }
+        if ( $source ) { update_post_meta( $post_id, '_ca_source_url', $source ); }
+        update_post_meta( $post_id, '_ca_ai_reviewed', '0' );
         global $wpdb;
-        $wpdb->insert( $wpdb->prefix . 'ca_civic_ai_log', array(
-            'brief_post_id'  => $post_id,
-            'prompt_version' => sanitize_text_field( $params['prompt_version'] ?? '' ),
-            'prompt_text'    => wp_kses_post( $params['prompt'] ?? '' ),
-            'ai_output'      => wp_kses_post( $params['content'] ),
-            'model'          => sanitize_text_field( $params['model'] ?? '' ),
-        ), array( '%d', '%s', '%s', '%s', '%s' ) );
-        return rest_ensure_response( array( 'id' => $post_id, 'status' => 'draft', 'message' => 'Brief created as draft pending editor review.' ) );
+        $wpdb->insert( $wpdb->prefix . 'ca_civic_ingestion_log', array(
+            'source_name' => isset( $params['source_name'] ) ? sanitize_text_field( $params['source_name'] ) : 'api',
+            'source_url' => $source, 'record_type' => $type,
+            'raw_payload' => wp_json_encode( $params ), 'post_id' => $post_id,
+            'status' => 'ingested', 'ingested_at' => current_time( 'mysql', true ),
+        ), array( '%s', '%s', '%s', '%s', '%d', '%s', '%s' ) );
+        return rest_ensure_response( array( 'success' => true, 'post_id' => $post_id, 'post_status' => 'draft', 'message' => 'Ingested as draft.' ) );
     }
 
-    public static function ingest_event( $request ) {
-        $params = $request->get_json_params();
-        if ( empty( $params['title'] ) ) return new WP_Error( 'missing_title', 'title is required.', array( 'status' => 400 ) );
-        $post_id = wp_insert_post( array( 'post_type' => 'ca_public_event', 'post_title' => sanitize_text_field( $params['title'] ), 'post_content' => wp_kses_post( $params['content'] ?? '' ), 'post_status' => 'draft' ), true );
-        if ( is_wp_error( $post_id ) ) return $post_id;
-        return rest_ensure_response( array( 'id' => $post_id, 'status' => 'draft' ) );
+    public static function get_submission_status( $request ) {
+        $id = (int) $request['id']; $post = get_post( $id );
+        if ( ! $post || $post->post_type !== 'ca_submission' ) {
+            return new WP_Error( 'not_found', 'Not found.', array( 'status' => 404 ) );
+        }
+        return rest_ensure_response( array( 'id' => $id, 'status' => $post->post_status, 'date' => $post->post_date_gmt ) );
     }
 
-    public static function ingest_bill( $request ) {
-        $params = $request->get_json_params();
-        if ( empty( $params['title'] ) ) return new WP_Error( 'missing_title', 'title is required.', array( 'status' => 400 ) );
-        $post_id = wp_insert_post( array( 'post_type' => 'ca_bill', 'post_title' => sanitize_text_field( $params['title'] ), 'post_content' => wp_kses_post( $params['content'] ?? '' ), 'post_status' => 'draft' ), true );
-        if ( is_wp_error( $post_id ) ) return $post_id;
-        if ( ! empty( $params['bill_number'] ) ) update_post_meta( $post_id, '_ca_bill_number', sanitize_text_field( $params['bill_number'] ) );
-        if ( ! empty( $params['leginfo_url'] ) ) update_post_meta( $post_id, '_ca_leginfo_url', esc_url_raw( $params['leginfo_url'] ) );
-        return rest_ensure_response( array( 'id' => $post_id, 'status' => 'draft' ) );
-    }
-
-    public static function ingest_docket( $request ) {
-        $params = $request->get_json_params();
-        if ( empty( $params['title'] ) ) return new WP_Error( 'missing_title', 'title is required.', array( 'status' => 400 ) );
-        $post_id = wp_insert_post( array( 'post_type' => 'ca_reg_docket', 'post_title' => sanitize_text_field( $params['title'] ), 'post_content' => wp_kses_post( $params['content'] ?? '' ), 'post_status' => 'draft' ), true );
-        if ( is_wp_error( $post_id ) ) return $post_id;
-        if ( ! empty( $params['docket_number'] ) ) update_post_meta( $post_id, '_ca_docket_number', sanitize_text_field( $params['docket_number'] ) );
-        if ( ! empty( $params['comment_deadline'] ) ) update_post_meta( $post_id, '_ca_comment_deadline', sanitize_text_field( $params['comment_deadline'] ) );
-        return rest_ensure_response( array( 'id' => $post_id, 'status' => 'draft' ) );
+    public static function check_hmac( $request ) {
+        $secret = defined( 'CA_CIVIC_HMAC_SECRET' ) ? CA_CIVIC_HMAC_SECRET : '';
+        if ( empty( $secret ) ) {
+            if ( defined( 'WP_DEBUG' ) && WP_DEBUG ) { return true; }
+            return new WP_Error( 'not_configured', 'HMAC secret not configured.', array( 'status' => 503 ) );
+        }
+        $sig = $request->get_header( 'X-CA-Civic-Signature' );
+        if ( empty( $sig ) ) {
+            return new WP_Error( 'missing_signature', 'Missing sig.', array( 'status' => 401 ) );
+        }
+        $expected = 'sha256=' . hash_hmac( 'sha256', $request->get_body(), $secret );
+        if ( ! hash_equals( $expected, $sig ) ) {
+            return new WP_Error( 'invalid_signature', 'Invalid HMAC.', array( 'status' => 401 ) );
+        }
+        return true;
     }
 }
